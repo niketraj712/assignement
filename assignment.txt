@@ -1,4 +1,4 @@
-
+Please refer to assignment.txt file data models and other details
 Repository Overview
 .
 ├── README.md
@@ -266,3 +266,4 @@ conn = psycopg2.connect(
 )
 
 df.to_sql("fact_message", conn, if_exists="append", index=False)
+
