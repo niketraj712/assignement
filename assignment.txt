@@ -1,0 +1,268 @@
+
+Repository Overview
+.
+├── README.md
+├── docker-compose.yaml
+├── scripts/
+│   ├── init_db.sql
+│   ├── data_transformation.sql
+│   └── pipeline.py
+├── analysis/
+│   ├── task3_q1.sql
+│   ├── task3_q2.sql
+│   ├── task3_q3.sql
+│   └── task3_q4.sql
+├── sample_data/
+│   └── mock_messages.csv
+└── docs/
+    ├── data_model.md
+    └── success_metrics.md
+
+
+
+====== Core Tables=====
+Dimension Tables
+dim_website
+CREATE TABLE dim_website (
+    website_id UUID PRIMARY KEY,
+    website_domain TEXT NOT NULL UNIQUE,
+    industry TEXT,
+    created_at TIMESTAMP DEFAULT now()
+);
+
+dim_user
+CREATE TABLE dim_user (
+    user_id UUID PRIMARY KEY,
+    website_id UUID REFERENCES dim_website(website_id),
+    language TEXT,
+    country TEXT,
+    user_agent TEXT,
+    created_at TIMESTAMP DEFAULT now()
+);
+
+Fact Tables
+fact_session
+CREATE TABLE fact_session (
+    session_id UUID PRIMARY KEY,
+    user_id UUID REFERENCES dim_user(user_id),
+    website_id UUID REFERENCES dim_website(website_id),
+    ip_address VARCHAR(15),
+    channel TEXT,
+    intent TEXT,
+    status TEXT,
+    session_starttstamp TIMESTAMP NOT NULL,
+    session_endtstamp TIMESTAMP,
+    created_at TIMESTAMP DEFAULT now()
+);
+
+CREATE INDEX idx_session_ip ON fact_session(ip_address);
+CREATE INDEX idx_session_start ON fact_session(session_starttstamp);
+
+fact_message
+CREATE TABLE fact_message (
+    message_id UUID PRIMARY KEY,
+    session_id UUID REFERENCES fact_session(session_id),
+    sender_type TEXT CHECK (sender_type IN ('user','agent')),
+    message_tstamp TIMESTAMP NOT NULL,
+    content TEXT,
+    content_type TEXT,
+    intent TEXT,
+    sentiment_score NUMERIC(4,2),
+    created_at TIMESTAMP DEFAULT now()
+);
+
+CREATE INDEX idx_message_session ON fact_message(session_id);
+CREATE INDEX idx_message_time ON fact_message(message_tstamp);
+
+=====================================================================
+
+ Data Model Rationale (for docs/data_model.md)
+
+Sessions are first-class → simplifies duration & concurrency analytics
+
+Messages are immutable facts
+
+NLP fields optional → allows partial enrichment
+
+IP stored at session level → avoids duplication
+==========================================================================
+
+Docker Setup
+docker-compose.yaml
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: chatbot
+      POSTGRES_PASSWORD: chatbot
+      POSTGRES_DB: chatbot_analytics
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+
+=======================================================
+Sample Data
+scripts/init_db.sql
+-- Websites
+INSERT INTO dim_website VALUES
+(gen_random_uuid(), 'shop.sg', 'ecommerce'),
+(gen_random_uuid(), 'gov.sg', 'public');
+
+-- Users
+INSERT INTO dim_user VALUES
+(gen_random_uuid(), (SELECT website_id FROM dim_website LIMIT 1), 'en', 'SG', 'Chrome', now()),
+(gen_random_uuid(), (SELECT website_id FROM dim_website OFFSET 1 LIMIT 1), 'en', 'SG', 'Safari', now());
+
+-- Sessions
+INSERT INTO fact_session VALUES
+(gen_random_uuid(), (SELECT user_id FROM dim_user LIMIT 1),
+ (SELECT website_id FROM dim_website LIMIT 1),
+ '192.168.0.12', 'web', 'faq', 'completed',
+ '2026-01-22 08:30:00', '2026-01-22 08:45:00', now()),
+
+(gen_random_uuid(), (SELECT user_id FROM dim_user OFFSET 1 LIMIT 1),
+ (SELECT website_id FROM dim_website OFFSET 1 LIMIT 1),
+ '192.168.0.12', 'web', 'support', 'abandoned',
+ '2026-01-22 09:01:15', '2026-01-22 09:05:00', now());
+================================================================================
+Task 2 — Success Metrics
+2.1 Proposed Metrics
+Metric 1: Completion Rate
+
+Definition: % of sessions with status = 'completed'
+
+Why: Measures task success without user surveys
+Signals: session status
+Validation: filter bot IPs, min session duration > 10s
+==================================================================================
+Metric 2: Avg Agent Response Time
+
+Definition: Avg time between user message and next agent reply
+
+Why: Proxy for responsiveness
+Signals: message timestamps
+Validation: exclude system messages, cap outliers
+=========================================================================
+Metric 3: Short Conversation Rate
+
+Definition: Sessions with < 3 messages OR duration < 60s
+
+Why: Drop-off / dissatisfaction signal
+Signals: message counts, session duration
+Validation: exclude test users, language filters
+========================================================================
+Aggregated Metrics Table
+session_metrics
+CREATE TABLE session_metrics AS
+SELECT
+    s.session_id,
+    s.website_id,
+    s.ip_address,
+    COUNT(m.message_id) AS total_messages,
+    EXTRACT(EPOCH FROM (s.session_endtstamp - s.session_starttstamp)) AS session_duration_sec,
+    CASE
+        WHEN COUNT(m.message_id) < 3
+          OR EXTRACT(EPOCH FROM (s.session_endtstamp - s.session_starttstamp)) < 60
+        THEN TRUE ELSE FALSE
+    END AS is_short_conversation
+FROM fact_session s
+LEFT JOIN fact_message m ON s.session_id = m.session_id
+GROUP BY s.session_id, s.website_id, s.ip_address, s.session_starttstamp, s.session_endtstamp;
+========================================================================================================
+3.1 Long Sessions by IP
+analysis/task3_q1.sql
+SELECT
+    ip_address,
+    AVG(session_duration_sec) / 60 AS avg_duration_minutes
+FROM session_metrics
+GROUP BY ip_address
+HAVING AVG(session_duration_sec) > 900;
+==============================================================================================
+3.2 Idle Time Between Sessions
+analysis/task3_q2.sql
+SELECT
+    session_id,
+    ip_address,
+    session_starttstamp,
+    LAG(session_endtstamp) OVER (
+        PARTITION BY ip_address
+        ORDER BY session_starttstamp
+    ) AS prev_session_endtstamp,
+    EXTRACT(EPOCH FROM (
+        session_starttstamp -
+        LAG(session_endtstamp) OVER (
+            PARTITION BY ip_address
+            ORDER BY session_starttstamp
+        )
+    )) AS idle_time_seconds
+FROM fact_session;
+================================================================================================
+3.3 Conversation Quality Signals
+analysis/task3_q3.sql
+WITH session_stats AS (
+    SELECT
+        s.session_id,
+        s.website_id,
+        s.ip_address,
+        s.session_starttstamp,
+        COUNT(m.message_id) AS total_messages,
+        EXTRACT(EPOCH FROM (s.session_endtstamp - s.session_starttstamp)) AS duration_sec,
+        CASE
+            WHEN COUNT(m.message_id) < 3 OR
+                 EXTRACT(EPOCH FROM (s.session_endtstamp - s.session_starttstamp)) < 60
+            THEN 1 ELSE 0
+        END AS is_short
+    FROM fact_session s
+    LEFT JOIN fact_message m ON s.session_id = m.session_id
+    GROUP BY s.session_id, s.website_id, s.ip_address, s.session_starttstamp, s.session_endtstamp
+)
+SELECT
+    w.website_domain,
+    COUNT(*) AS total_sessions,
+    SUM(is_short) AS short_sessions,
+    ROUND(100.0 * SUM(is_short) / COUNT(*), 2) AS pct_short_sessions
+FROM session_stats ss
+JOIN dim_website w ON ss.website_id = w.website_id
+GROUP BY w.website_domain;
+====================================================================================
+3.4 Peak Traffic & Concurrency
+analysis/task3_q4.sql
+WITH hours AS (
+    SELECT generate_series(
+        '2026-01-22 00:00:00'::timestamp,
+        '2026-01-22 23:00:00'::timestamp,
+        interval '1 hour'
+    ) AS hour_bucket
+)
+SELECT
+    h.hour_bucket,
+    COUNT(s.session_id) FILTER (
+        WHERE date_trunc('hour', s.session_starttstamp) = h.hour_bucket
+    ) AS sessions_started,
+    COUNT(s.session_id) FILTER (
+        WHERE s.session_starttstamp <= h.hour_bucket
+          AND s.session_endtstamp >= h.hour_bucket
+    ) AS active_sessions
+FROM hours h
+LEFT JOIN fact_session s ON TRUE
+GROUP BY h.hour_bucket
+ORDER BY h.hour_bucket;
+=================================================================================================
+Optional Python Pipeline (Bonus)
+scripts/pipeline.py
+import pandas as pd
+import psycopg2
+
+df = pd.read_csv("sample_data/mock_messages.csv")
+
+conn = psycopg2.connect(
+    dbname="chatbot_analytics",
+    user="chatbot",
+    password="chatbot",
+    host="localhost"
+)
+
+df.to_sql("fact_message", conn, if_exists="append", index=False)
